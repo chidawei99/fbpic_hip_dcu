@@ -1,0 +1,28 @@
+conda create -n numba_dtk_openmpi python=3.9
+
+conda activate numba_dtk_openmpi
+
+module load compiler/dtk/25.04                                    mpi/openmpi/openmpi-4.1.5-gcc9.3.0
+
+cd /public/home/chidawei/fbpic_dcu_transpant/fbpic_base_mpi/tests
+
+cd   project(存放安装包的目录）
+
+python -m pip install numpy==1.24
+conda install -c conda-forge numpy=1.24
+
+tar -zxvf cupy-v12.3.0.dtk2504-27Feb2025.tar.gz
+
+cd cupy-v12.3.0.dtk2504-27Feb2025
+
+ python -m pip install cupy-12.3.0-cp39-cp39-linux_x86_64.whl
+
+python -m pip install numba
+
+conda install -c conda-forge mpi4py openmpi pyfftw --freeze-installed
+conda install -c conda-forge pyfftw
+
+ python -m pip install -r requirements.txt
+
+cd /path/to/your/fbpic/
+python -m pip install -e .

@@ -1,0 +1,194 @@
+import math
+
+from numba import (config, float32, float64, uint32, int64, uint64,
+                   from_dtype, jit)
+
+import numpy as np
+import cupy as cp
+
+# This implementation is based upon the xoroshiro128+ and splitmix64 algorithms
+# described at:
+#
+#     http://xoroshiro.di.unimi.it/
+#
+# and originally implemented by David Blackman and Sebastiano Vigna.
+#
+# The implementations below are based on the C source code:
+#
+#  * http://xoroshiro.di.unimi.it/xoroshiro128plus.c
+#  * http://xoroshiro.di.unimi.it/splitmix64.c
+#
+# Splitmix64 is used to generate the initial state of the xoroshiro128+
+# generator to ensure that small seeds don't result in predictable output.
+
+# **WARNING**: There is a lot of verbose casting in this file to ensure that
+# NumPy casting conventions (which cast uint64 [op] int32 to float64) don't
+# turn integers into floats when using these functions in the CUDA simulator.
+#
+# There are also no function type signatures to ensure that compilation is
+# deferred so that import is quick, and Sphinx autodoc works.  We are also
+# using the CPU @jit decorator everywhere to create functions that work as
+# both CPU and CUDA device functions.
+
+xoroshiro128p_dtype = np.dtype([('s0', np.uint64), ('s1', np.uint64)],
+                               align=True)
+xoroshiro128p_type = from_dtype(xoroshiro128p_dtype)
+names = ['s0', 's1']
+types = [np.uint64]*2
+uint2 = np.dtype({'names': names, 'formats': types})
+
+# When cudasim is enabled, Fake CUDA arrays are passed to some of the
+# @jit-decorated functions. This required fallback to object mode. With
+# Numba 0.59.0 object mode must be explicitly enabled.
+# https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-object-mode-fall-back-behaviour-when-using-jit
+# In order to avoid the warning / future error, we explicitly specify that
+# object mode with loop lifting is acceptable when using the simulator.
+_forceobj = _looplift = config.ENABLE_CUDASIM
+_nopython = not config.ENABLE_CUDASIM
+
+
+@jit(forceobj=_forceobj, looplift=_looplift, nopython=_nopython)
+def init_xoroshiro128p_state(states, index, seed):
+    '''Use SplitMix64 to generate an xoroshiro128p state from 64-bit seed.
+
+    This ensures that manually set small seeds don't result in a predictable
+    initial sequence from the random number generator.
+
+    :type states: 1D array, dtype=xoroshiro128p_dtype
+    :param states: array of RNG states
+    :type index: uint64
+    :param index: offset in states to update
+    :type seed: int64
+    :param seed: seed value to use when initializing state
+    '''
+    index = int64(index)
+    seed = uint64(seed)
+
+    z = seed + uint64(0x9E3779B97F4A7C15)
+    z = (z ^ (z >> uint32(30))) * uint64(0xBF58476D1CE4E5B9)
+    z = (z ^ (z >> uint32(27))) * uint64(0x94D049BB133111EB)
+    z = z ^ (z >> uint32(31))
+
+    states[index]['s0'] = z
+    states[index]['s1'] = z
+
+
+@jit(forceobj=_forceobj, looplift=_looplift, nopython=_nopython)
+def rotl(x, k):
+    '''Left rotate x by k bits.'''
+    x = uint64(x)
+    k = uint32(k)
+    return (x << k) | (x >> uint32(64 - k))
+
+
+@jit(forceobj=_forceobj, looplift=_looplift, nopython=_nopython)
+def xoroshiro128p_next(states, index):
+    '''Return the next random uint64 and advance the RNG in states[index].
+
+    :type states: 1D array, dtype=xoroshiro128p_dtype
+    :param states: array of RNG states
+    :type index: int64
+    :param index: offset in states to update
+    :rtype: uint64
+    '''
+    index = int64(index)
+    s0 = states[index]['s0']
+    s1 = states[index]['s1']
+    result = s0 + s1
+
+    s1 ^= s0
+    states[index]['s0'] = uint64(rotl(s0, uint32(55))) ^ s1 ^ (s1 << uint32(14))
+    states[index]['s1'] = uint64(rotl(s1, uint32(36)))
+
+    return result
+
+
+@jit(forceobj=_forceobj, looplift=_looplift, nopython=_nopython)
+def xoroshiro128p_jump(states, index):
+    '''Advance the RNG in ``states[index]`` by 2**64 steps.
+
+    :type states: 1D array, dtype=xoroshiro128p_dtype
+    :param states: array of RNG states
+    :type index: int64
+    :param index: offset in states to update
+    '''
+    index = int64(index)
+
+    jump = (uint64(0xbeac0467eba5facb), uint64(0xd86b048b86aa9922))
+
+    s0 = uint64(0)
+    s1 = uint64(0)
+
+    for i in range(2):
+        for b in range(64):
+            if jump[i] & (uint64(1) << uint32(b)):
+                s0 ^= states[index]['s0']
+                s1 ^= states[index]['s1']
+            xoroshiro128p_next(states, index)
+
+    states[index]['s0'] = s0
+    states[index]['s1'] = s1
+
+
+@jit(forceobj=_forceobj, looplift=_looplift, nopython=_nopython)
+def uint64_to_unit_float64(x):
+    '''Convert uint64 to float64 value in the range [0.0, 1.0)'''
+    x = uint64(x)
+    return (x >> uint32(11)) * (float64(1) / (uint64(1) << uint32(53)))
+
+
+@jit(forceobj=_forceobj, looplift=_looplift, nopython=_nopython)
+def xoroshiro128p_uniform_float64(states, index):
+    '''Return a float64 in range [0.0, 1.0) and advance ``states[index]``.
+
+    :type states: 1D array, dtype=xoroshiro128p_dtype
+    :param states: array of RNG states
+    :type index: int64
+    :param index: offset in states to update
+    :rtype: float64
+    '''
+    index = int64(index)
+    return uint64_to_unit_float64(xoroshiro128p_next(states, index))
+
+
+@jit(forceobj=_forceobj, looplift=_looplift, nopython=_nopython)
+def init_xoroshiro128p_states_cpu(states, seed, subsequence_start):
+    n = states.shape[0]
+    seed = uint64(seed)
+    subsequence_start = uint64(subsequence_start)
+
+    if n >= 1:
+        init_xoroshiro128p_state(states, 0, seed)
+
+        # advance to starting subsequence number
+        for _ in range(subsequence_start):
+            xoroshiro128p_jump(states, 0)
+
+        # populate the rest of the array
+        for i in range(1, n):
+            states[i] = states[i - 1]  # take state of previous generator
+            xoroshiro128p_jump(states, i)  # and jump forward 2**64 steps
+
+
+def init_xoroshiro128p_states(n, seed, subsequence_start=0):
+    '''Initialize RNG states on the GPU for parallel generators.
+
+    This initializes the RNG states so that each state in the array corresponds
+    subsequences in the separated by 2**64 steps from each other in the main
+    sequence.  Therefore, as long no CUDA thread requests more than 2**64
+    random numbers, all of the RNG states produced by this function are
+    guaranteed to be independent.
+
+    The subsequence_start parameter can be used to advance the first RNG state
+    by a multiple of 2**64 steps.
+
+    :type states: 1D DeviceNDArray, dtype=xoroshiro128p_dtype
+    :param states: array of RNG states
+    :type seed: uint64
+    :param seed: starting seed for list of generators
+    '''
+
+    # Initialization on CPU is much faster than the GPU
+    states_cpu = np.empty(n, dtype=uint2)
+    init_xoroshiro128p_states_cpu(states_cpu, seed, subsequence_start)
+    return states_cpu

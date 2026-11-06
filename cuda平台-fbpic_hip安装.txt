@@ -1,0 +1,18 @@
+conda create -n fbpic_unsorted python=3.10
+
+source .bashrc
+
+conda activate fbpic_unsorted
+conda activate fbpic_ori
+
+python -m pip install numba==0.62.1
+ 原始fbpic需要用cuda时   python -m pip install numba-cuda
+
+python -m pip install cupy-cuda12x
+
+conda install -c conda-forge "numpy=1.24.*" pyfftw
+
+ python -m pip install -r requirements.txt
+
+cd /path/to/your/fbpic/
+python -m pip install -e .
